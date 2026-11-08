@@ -1,78 +1,86 @@
 # ComfyUI-SimpleMerge-ReleaseSources
 
-Two drop-in merge nodes with an optional `release_sources` toggle:
+Two drop-in ComfyUI merges with a `release_sources` boolean:
 
 - **Model Merge Simple (Release Sources)** — `ModelMergeSimpleRelease`
 - **CLIP Merge Simple (Release Sources)** — `CLIPMergeSimpleRelease`
 
-**This extension materializes independent weights. It does not evict source checkpoints from ComfyUI's execution cache.** Enabling it can increase RAM usage. Use it on the final MODEL and CLIP merges first, and keep intermediate toggles off.
+**Actual source release requires the explicit, reviewed [three-file ComfyUI cache integration](integration/README.md).** The extension never installs that patch automatically. Without it, `release_sources=True` fails before allocating an independent model; `False` uses the installed stock merge.
 
-## Install
+## What the boolean does
 
-From your ComfyUI directory:
+`False` delegates directly to the installed native merge, with no full-model copies. `True` first creates the same native lazy merge, then bakes its effective weights into a separately owned CPU module. Once it succeeds, it requests release of upstream MODEL/CLIP cache outputs. The executor drops each requested output only after its remaining consumers finish, including shared branches and async work. It retains non-model outputs such as VAE and leaves the independent final merge cached.
+
+This also removes source references from current-prompt input caches. Inactive cached versions of the affected producers are retired so that an old lazy merge does not keep the same checkpoints alive. Entries used by the active prompt remain protected. No global model unloading, CUDA-cache clearing, or executor/cache monkeypatch is installed by the node.
+
+Changing only downstream seeds/prompts can reuse the final MODEL, CLIP and retained VAE without reloading source checkpoints. Changing merge ratios, checkpoint names, or the toggle invalidates the relevant native cache signatures; missing source slots then cause ordinary loader execution. Normal cache policy still applies: severe RAM pressure can evict a final merge and require rebuilding it.
+
+Source cache release is real; other live branches, extensions or tensor aliases can still retain weights. Logs report tracked CPU source tensors collected and actual process RSS before/after, rather than treating GPU unloading or garbage-collector counts as proof.
+
+## Install and enable
+
+From ComfyUI's root:
 
 ```bash
 git clone https://github.com/a-l-e-x-d-s-9/ComfyUI-SimpleMerge-ReleaseSources.git custom_nodes/ComfyUI-SimpleMerge-ReleaseSources
+
+# Read-only compatibility check: no core files are modified.
+venv/bin/python custom_nodes/ComfyUI-SimpleMerge-ReleaseSources/scripts/install_cache_integration.py --comfy-root .
+
+# After explicitly reviewing/authorizing the core integration:
+venv/bin/python custom_nodes/ComfyUI-SimpleMerge-ReleaseSources/scripts/install_cache_integration.py --comfy-root . --apply
 ```
 
-Restart ComfyUI, then search for the two display names above. There are no additional pip requirements beyond ComfyUI's existing PyTorch, Transformers and Tokenizers dependencies. `psutil` is optional for diagnostics and RAM preflight.
+Restart ComfyUI and search for the display names above. There are no extra mandatory pip dependencies beyond ComfyUI's existing PyTorch/Transformers/Tokenizers stack. `psutil` is optional for RAM diagnostics/preflight. The installer checks exact source hashes and refuses unknown/modified core versions. [Integration details and rollback](integration/README.md).
 
-## Behavior
+## Existing workflows
 
-Inputs, connections and ratios match the stock nodes. `ratio=1` selects model1's effective weights; `ratio=0` selects model2's effective weights for matching mergeable keys. CLIP keeps CLIP1's tokenizer/settings and the stock exclusions for `.position_ids` and `.logit_scale`.
-
-With `release_sources=False` (default), the node delegates directly to the installed built-in merge, adding no full-model copies. With `True`, it first constructs that same native lazy merge, then evaluates each tensor through the installed `ModelPatcher.patch_weight_to_device(..., return_weight=True)` path, including nested patches and native dtype rounding. The output owns a separate module and CPU storage, with fresh patch/backup/parent state. Original inputs are never loaded, unpatched, or changed by materialization. Subsequent LoRAs can be applied normally.
-
-The module skeleton is copied with meta-device placeholders; full weight tensors are filled individually. Native loaded-model backups supply the original base when another clone has already patched the shared module. Nonpersistent buffers, model sampling/configuration, declared model options, object patches, precision and load/offload settings are copied. CLIP's tokenizer backend is reconstructed independently, including its decoder closure. This avoids copying the full source module's weights before baking them.
-
-GPU VRAM release moves or unloads device allocations; it does not necessarily free CPU weights. Materialization creates independently owned effective weights, which costs another output-sized allocation in CPU RAM. Reclaiming source CPU RAM requires **every owner** of the source weights to disappear: loader outputs, intermediate lazy patch lists, execution-cache entries, current node inputs and other graph branches may still retain them. This extension neither clears those owners nor calls global model unloading or CUDA-cache clearing.
-
-## Convert an existing workflow
+Inputs, connections and ratios match stock nodes. `ratio=1` selects model1's effective weights; `ratio=0` selects model2's effective weights for matching mergeable keys. CLIP preserves CLIP1's tokenizer/settings and native `.position_ids`/`.logit_scale` exclusions. Fresh LoRAs can be applied afterward.
 
 ```bash
 venv/bin/python custom_nodes/ComfyUI-SimpleMerge-ReleaseSources/scripts/convert_workflow.py \
   user/default/workflows/Sassy_Girls_Illustrious_2.0.json
 ```
 
-This creates `Sassy_Girls_Illustrious_2.0_ReleaseSources.json` beside the source. Load that copy in the visual editor. All nine MODEL and nine CLIP node types are replaced; only final MODEL **2023** and final CLIP **2022** get `True`. IDs, link IDs, ratios, positions, other nodes and settings are preserved. A boolean socket/widget and the workflow's named widget values are updated; misleading `comfy-core` metadata is removed from the converted nodes. Conversion is idempotent, checks link endpoints/socket references, and refuses to overwrite any output file. Other workflows can specify `--final-model ID --final-clip ID`.
+This creates `Sassy_Girls_Illustrious_2.0_ReleaseSources.json` beside the source. All nine MODEL and nine CLIP merge types are replaced; only final MODEL **2023** and final CLIP **2022** enable the boolean. IDs, link IDs, positions, ratios and unrelated nodes/settings are preserved. Added widgets/named values and node heights are updated, misleading `comfy-core` metadata is removed, link endpoints are validated, and conversion is idempotent. The script refuses to overwrite files. Other graphs can specify `--final-model ID --final-clip ID`.
 
-The user's full workflow is intentionally not distributed in this public repository. Its converted copy stays in the user's workflow directory.
+The user's complete workflow, private logs and generated test images are not distributed in this public repository.
 
-## Cache and RAM limits
+## Memory limits
 
-Queue three generations with different downstream seeds/prompts. The final merge nodes should be listed in ComfyUI's `execution_cached` event after the first run. Ordinary input fingerprints include the boolean, so toggling it invalidates the node. There is no `IS_CHANGED` override or output-node flag forcing re-execution.
+With only the final merges enabled, source release occurs **after those merges finish**. It does not reduce the RAM needed to load all checkpoints and bake the first final output. The measured two-source sizes imply roughly 63 GiB of MODEL+CLIP source weights for ten checkpoints, plus 6.3 GiB for the independent final pair and additional scratch/VAEs/runtime memory. That exceeds the rig's 60.7 GiB physical RAM.
 
-Default RAM-pressure caching may evict outputs under pressure; it cannot guarantee the final merge stays resident. `--cache-classic` more aggressively retains unchanged outputs, including source loaders: it favors reuse at a higher RAM cost. Neither mode becomes a source-release mechanism just because this toggle is enabled. The object cache retains these stateless node instances, not their input weights; the output cache and currently executing input lists are separate owners. Static model-manager entries can also retain loaded modules. No cache integration or core monkeypatch is installed.
+Enabling intermediate materialization can let earlier sources be reclaimed sooner, but adds work and rounds intermediate weights back to storage dtype. That can differ slightly from a fully lazy native merge chain, which evaluates nested patches at higher precision. It is a separate experiment and is not automatically enabled throughout the ten-model workflow. The full ten-model workflow was not run during these bounded tests.
 
-For ten dense SDXL/Illustrious checkpoints, measured two-model sizes imply roughly **63 GiB of source MODEL+CLIP weights plus 6.3 GiB of independent final outputs**, before Python, VAEs, tensor scratch and sampling. That exceeds 60 GiB usable physical RAM. Repeated materialization at intermediate stages makes this worse while caches retain sources. A node cannot schedule serial checkpoint loading or safely delete arbitrary upstream cache outputs while other consumers may still need them.
+Default RAM-pressure caching is a reasonable starting policy once sources can actually be released. Classic caching can retain the final output more aggressively, but does not reserve RAM or guarantee that a model stays on the GPU. Avoid `--cache-none`, which cannot retain the final merge. External cache providers are rejected for source-release mode because they may retain additional source copies.
 
-The smallest reliable operational change is a separate build phase that saves the final merged checkpoint, followed by a generation workflow loading that single artifact. This uses existing checkpoint-save/load nodes and requires no core edits. A future streaming merger would need its own serial loader and accumulation lifecycle, rather than two drop-in nodes. This release does not replace the user's graph or add that feature.
+For the lowest build-time peak, a future serial/streaming loader would need its own loading and accumulation lifecycle. Saving the merged checkpoint in a build phase and generating from that single file remains another reliable option. Neither feature replaces the user's graph automatically.
 
-## Supported inputs and diagnostics
+## Implementation and compatibility
 
-Tested with native static dense SDXL/Illustrious fp16 checkpoints on ComfyUI `c9ea36b9d2140c89b2ef84f93f428df474e72ba5` (`v0.41.0-14-gc9ea36b9d`), Python 3.10 and PyTorch `2.12.1+cu130`. Small parity tests also cover float32 and bfloat16. Materialization requires the native static `ModelPatcher`; use `--disable-dynamic-vram` for these dense models. The lazy path remains whatever your installed stock node supports.
+Tested with ComfyUI `c9ea36b9d2140c89b2ef84f93f428df474e72ba5` (`v0.41.0-14-gc9ea36b9d`), Python 3.10.6, PyTorch 2.12.1+cu130, Transformers 5.2.0 and Tokenizers 0.22.1. Native static dense SDXL/Illustrious fp16 checkpoints were used. Small native parity tests also cover float32 and bfloat16. Use `--disable-dynamic-vram` for these static models.
 
-Materialization rejects dynamic/third-party patchers, quantized/custom/sparse/meta tensors, tied/noncontiguous weight storage, custom tensor setters for patched keys, object patches replacing registered weights (sampling settings excepted), active hooks, injections, attachments, additional models, weight wrappers and callback wrappers. Settings with model-owning closures/bound methods are also rejected rather than silently retained or discarded. Plain native model options and object patches are preserved. An actionable error suggests `release_sources=False` where stock behavior is needed. Available-RAM checks estimate output storage plus per-key nested patch scratch; they are not an allocation reservation or an OOM guarantee. Cancellation is checked between tensors.
+Baking uses native `patch_weight_to_device(..., return_weight=True)`, including loaded-source backups, nested patch evaluation and native dtype rounding. The skeleton uses meta placeholders, filled one tensor at a time. Nonpersistent buffers, sampling/configuration, declared model options, object patches, precision and device settings are preserved. CLIP's tokenizer backend and decoder closure are independently rebuilt. Output patch/backup/parent state is fresh; input weights are not modified.
 
-Logs distinguish process RSS, process peak RSS, available host RAM and PyTorch CUDA allocated/reserved memory in GiB. The peak is cumulative for the process, not an isolated merge peak. Without `psutil`, RSS/headroom fields and preflight are unavailable; the Linux process-peak diagnostic remains available. `materialized` does **not** mean `source RAM freed`: references still exist in the caller when the node returns, and cache ownership is not inspected from inside the node.
+Unsupported inputs raise actionable errors: dynamic/third-party patchers; quantized/custom/sparse/meta/tied/noncontiguous weight storage; custom setters for patched weights; weight-replacing object patches other than sampling settings; active hooks, injections, attachments, additional models and wrappers; or settings that retain model-owning closures/bound methods. `False` remains the stock path for those inputs. Available-RAM preflight is an estimate, not an allocation reservation. Cancellation is checked between tensors.
 
-Some tested source checkpoints already contain NaNs in six tensors of CLIP-L's last transformer layer. This extension preserves the native result and logs that fact; it does not sanitize source values. Native parity compares matching NaN masks explicitly. SDXL uses CLIP-L's penultimate hidden state and discards its pooled output; finite text conditioning and sampling must still be checked. An all-weights-finite assertion cannot pass for those source files.
+Some tested source files contain NaNs in six CLIP-L last-layer tensors. The extension preserves the native values and logs them. SDXL uses CLIP-L's penultimate hidden state and discards its pooled output; actual conditioning and sampling were verified. An all-weights-finite assertion cannot pass for those source files, so native parity compares matching NaN masks explicitly.
 
-Actual measurements and integration coverage are recorded in [TEST_RESULTS.md](TEST_RESULTS.md).
+## Validation
 
-## Tests
+See [SOURCE_RELEASE_RESULTS.md](SOURCE_RELEASE_RESULTS.md) for actual cache release and generation measurements. [TEST_RESULTS.md](TEST_RESULTS.md) records the historical materialize-only implementation and its limitations.
 
-Run from your ComfyUI root with its interpreter:
+Run from the matching ComfyUI root:
 
 ```bash
 venv/bin/python -m compileall -q custom_nodes/ComfyUI-SimpleMerge-ReleaseSources
 venv/bin/python -m unittest discover -s custom_nodes/ComfyUI-SimpleMerge-ReleaseSources/tests -v
 
-# Full real-checkpoint CPU parity; loads exactly two checkpoints.
+# Real-checkpoint CPU parity. Direct calls have no executor cache to release.
 venv/bin/python custom_nodes/ComfyUI-SimpleMerge-ReleaseSources/scripts/integration_parity.py \
   /path/to/checkpoint-a.safetensors /path/to/checkpoint-b.safetensors --comfy-root .
 ```
 
-The real-model test checks every native state-dict key at ratios 0, .25, .5, .75 and 1, a chained merge, storage separation, weak-reference collection and independent tokenization. `--quick` tests only .5. It deliberately runs outside the executor to distinguish actual source-object collection from executor cache retention. It does not claim to measure queued generation or GPU sampling. Small tests exercise loaded backups, native LoRA load/apply/unpatch, low-VRAM functions, cancellation, errors, branch-safe nonmutation, insufficient memory, boolean invalidation and both installed cache implementations.
+Executor-release tests are skipped on an unpatched core; the missing-integration fail-fast test still runs. GPU queue testing uses `scripts/integration_queue.py` against a dedicated idle test server. It queues three 256×256 two-step images and optionally a post-merge LoRA generation, then checks retained final merges and absent full source-loader entries.
 
 License: GPL-3.0-or-later.

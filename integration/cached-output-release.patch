@@ -1,0 +1,313 @@
+--- a/comfy_execution/caching.py
++++ b/comfy_execution/caching.py
+@@ -4,7 +4,7 @@
+ import logging
+ import time
+ import torch
+-from typing import Sequence, Mapping, Dict
++from typing import Sequence, Mapping, Dict, NamedTuple
+ from comfy.model_patcher import is_model_patcher_output
+ from comfy.system_memory import virtual_memory_available
+ from comfy_execution.graph import DynamicPrompt
+@@ -15,6 +15,38 @@
+ from comfy_execution.graph_utils import is_link
+ 
+ NODE_CLASS_CONTAINS_UNIQUE_ID: Dict[str, bool] = {}
++
++
++class _CacheEntry(NamedTuple):
++    ui: dict
++    outputs: list
++
++
++class CacheEntry(_CacheEntry):
++    # Keep the existing two-field tuple interface for cache consumers.
++    released: frozenset[int] = frozenset()
++    producer: tuple[str, str] | None = None
++
++    def __new__(cls, ui, outputs, *, released=frozenset(), producer=None):
++        entry = super().__new__(cls, ui, outputs)
++        entry.released = released
++        entry.producer = producer
++        return entry
++
++    def _replace(self, **kwargs):
++        entry = super()._replace(**kwargs)
++        entry.released = self.released
++        entry.producer = self.producer
++        return entry
++
++    def without_outputs(self, output_indices):
++        output_indices = frozenset(output_indices)
++        if any(index < 0 or index >= len(self.outputs) for index in output_indices):
++            raise IndexError("Invalid cached output index")
++        outputs = list(self.outputs)
++        for index in output_indices:
++            outputs[index] = []
++        return type(self)(self.ui, outputs, released=self.released | output_indices, producer=self.producer)
+ 
+ 
+ def include_unique_id_in_input(class_type: str) -> bool:
+@@ -200,13 +232,34 @@
+     def poll(self, **kwargs):
+         pass
+ 
+-    def get_local(self, node_id):
++    def get_local(self, node_id, output_index=None):
+         if not self.initialized:
+             return None
+         cache_key = self.cache_key_set.get_data_key(node_id)
+         if cache_key in self.cache:
+-            return self.cache[cache_key]
++            value = self.cache[cache_key]
++            if isinstance(value, CacheEntry) and value.released:
++                if output_index is None or output_index in value.released:
++                    return None
++            return value
+         return None
++
++    def release_outputs(self, node_id, output_indices):
++        self.release_previous_outputs(node_id, output_indices)
++        cache_key = self.cache_key_set.get_data_key(node_id)
++        value = self.cache.get(cache_key)
++        if not isinstance(value, CacheEntry):
++            return None
++        value = value.without_outputs(output_indices)
++        self.cache[cache_key] = value
++        return value
++
++    def release_previous_outputs(self, node_id, output_indices):
++        producer = (node_id, self.dynprompt.get_node(node_id)["class_type"])
++        used_keys = self.cache_key_set.get_used_keys()
++        for key, value in list(self.cache.items()):
++            if key not in used_keys and isinstance(value, CacheEntry) and value.producer == producer:
++                self.cache[key] = value.without_outputs(output_indices)
+ 
+     def set_local(self, node_id, value):
+         assert self.initialized
+@@ -226,7 +279,8 @@
+         cache_key = self.cache_key_set.get_data_key(node_id)
+ 
+         if cache_key in self.cache:
+-            return self.cache[cache_key]
++            value = self.cache[cache_key]
++            return None if isinstance(value, CacheEntry) and value.released else value
+ 
+         external_result = await self._check_providers_lookup(node_id, cache_key)
+         if external_result is not None:
+@@ -387,11 +441,22 @@
+             return None
+         return await cache._get_immediate(node_id)
+ 
+-    def get_local(self, node_id):
++    def get_local(self, node_id, output_index=None):
+         cache = self._get_cache_for(node_id)
+         if cache is None:
+             return None
+-        return BasicCache.get_local(cache, node_id)
++        return BasicCache.get_local(cache, node_id, output_index)
++
++    def release_outputs(self, node_id, output_indices):
++        cache = self._get_cache_for(node_id)
++        if cache is None:
++            return None
++        return BasicCache.release_outputs(cache, node_id, output_indices)
++
++    def release_previous_outputs(self, node_id, output_indices):
++        cache = self._get_cache_for(node_id)
++        if cache is not None:
++            BasicCache.release_previous_outputs(cache, node_id, output_indices)
+ 
+     async def set(self, node_id, value):
+         cache = self._get_cache_for(node_id)
+@@ -425,8 +490,14 @@
+     async def get(self, node_id):
+         return None
+ 
+-    def get_local(self, node_id):
++    def get_local(self, node_id, output_index=None):
+         return None
++
++    def release_outputs(self, node_id, output_indices):
++        return None
++
++    def release_previous_outputs(self, node_id, output_indices):
++        pass
+ 
+     async def set(self, node_id, value):
+         pass
+--- a/comfy_execution/graph.py
++++ b/comfy_execution/graph.py
+@@ -3,6 +3,7 @@
+ import nodes
+ import asyncio
+ import inspect
++import logging
+ from comfy_execution.graph_utils import is_link, ExecutionBlocker
+ from comfy.comfy_types.node_typing import ComfyNodeABC, InputTypeDict, InputTypeOptions
+ from comfy_api.internal import _ComfyNodeInternal
+@@ -143,7 +144,7 @@
+         self.add_strong_link(from_node_id, from_socket, to_node_id)
+ 
+     def add_strong_link(self, from_node_id, from_socket, to_node_id):
+-        if not self.is_cached(from_node_id):
++        if not self.is_output_cached(from_node_id, from_socket):
+             self.add_node(from_node_id)
+             if to_node_id not in self.blocking[from_node_id]:
+                 self.blocking[from_node_id][to_node_id] = {}
+@@ -173,7 +174,7 @@
+                     _, _, input_info = self.get_input_info(unique_id, input_name)
+                     is_lazy = input_info is not None and "lazy" in input_info and input_info["lazy"]
+                     if (include_lazy or not is_lazy):
+-                        if not self.is_cached(from_node_id):
++                        if not self.is_output_cached(from_node_id, from_socket):
+                             node_ids.append(from_node_id)
+                         links.append((from_node_id, from_socket, unique_id))
+ 
+@@ -201,6 +202,9 @@
+     def is_cached(self, node_id):
+         return False
+ 
++    def is_output_cached(self, node_id, output_index):
++        return self.is_cached(node_id)
++
+     def get_ready_nodes(self):
+         return [node_id for node_id in self.pendingNodes if self.blockCount[node_id] == 0]
+ 
+@@ -219,6 +223,8 @@
+     ExecutionList implements a topological dissolve of the graph. After a node is staged for execution,
+     it can still be returned to the graph after having further dependencies added.
+     """
++    OUTPUT_RELEASE_API_VERSION = 1
++
+     def __init__(self, dynprompt, output_cache, output_link_callback=None):
+         super().__init__(dynprompt)
+         self.output_cache = output_cache
+@@ -226,14 +232,20 @@
+         self.staged_node_id = None
+         self.execution_cache = {}
+         self.execution_cache_listeners = {}
++        self.output_release_requests = {}
++        self.output_release_callbacks = []
++        self.previous_output_release_requests = {}
+ 
+     def is_cached(self, node_id):
+         return self.output_cache.get_local(node_id) is not None
++
++    def is_output_cached(self, node_id, output_index):
++        return self.output_cache.get_local(node_id, output_index) is not None
+ 
+     def cache_link(self, from_node_id, to_node_id, from_socket=None):
+         if to_node_id not in self.execution_cache:
+             self.execution_cache[to_node_id] = {}
+-        value = self.output_cache.get_local(from_node_id)
++        value = self.output_cache.get_local(from_node_id, from_socket)
+         self.execution_cache[to_node_id][from_node_id] = value
+         if from_node_id not in self.execution_cache_listeners:
+             self.execution_cache_listeners[from_node_id] = set()
+@@ -371,6 +383,63 @@
+         self.execution_cache.pop(node_id, None)
+         self.execution_cache_listeners.pop(node_id, None)
+         self.staged_node_id = None
++        self._release_completed_outputs()
++
++    def request_output_release(self, outputs, on_release=None, retire_previous_outputs=()):
++        """Request cache-slot release after all current consumers have completed."""
++        assert self.staged_node_id is not None
++        if self.staged_node_id in outputs:
++            raise ValueError("A node cannot request release of its own outputs")
++        for node_id, indices in outputs.items():
++            self.output_release_requests.setdefault(node_id, set()).update(indices)
++        if on_release is not None:
++            self.output_release_callbacks.append(on_release)
++        if retire_previous_outputs:
++            self.previous_output_release_requests.setdefault(self.staged_node_id, set()).update(retire_previous_outputs)
++
++    def _output_has_pending_consumer(self, node_id, output_index):
++        if node_id in self.pendingNodes:
++            return True
++        source = self.output_cache.get_local(node_id, output_index)
++        for consumer_id in self.pendingNodes:
++            inputs = self.dynprompt.get_node(consumer_id)["inputs"]
++            linked_indices = set()
++            for value in inputs.values():
++                if not is_link(value):
++                    continue
++                if value[0] == node_id or (source is not None and self.output_cache.get_local(value[0], output_index) is source):
++                    linked_indices.add(value[1])
++            if output_index in linked_indices:
++                return True
++            # Expanded subgraphs can register execution-cache links without a
++            # corresponding static input. Keep all their source slots alive.
++            if not linked_indices and node_id in self.execution_cache.get(consumer_id, {}):
++                return True
++        return False
++
++    def _release_completed_outputs(self):
++        for node_id, indices in self.previous_output_release_requests.items():
++            self.output_cache.release_previous_outputs(node_id, indices)
++        self.previous_output_release_requests.clear()
++        for node_id, indices in list(self.output_release_requests.items()):
++            ready = {index for index in indices if not self._output_has_pending_consumer(node_id, index)}
++            if not ready:
++                continue
++            entry = self.output_cache.release_outputs(node_id, ready)
++            for inputs in self.execution_cache.values():
++                previous = inputs.get(node_id)
++                if previous is not None:
++                    inputs[node_id] = entry if entry is not None else previous.without_outputs(ready)
++            indices.difference_update(ready)
++            if not indices:
++                del self.output_release_requests[node_id]
++        if not self.output_release_requests:
++            callbacks, self.output_release_callbacks = self.output_release_callbacks, []
++            for callback in callbacks:
++                try:
++                    callback()
++                except Exception:
++                    logging.exception("Cached-output release diagnostic failed")
+ 
+     def get_nodes_in_cycle(self):
+         # We'll dissolve the graph in reverse topological order to leave only the nodes in the cycle.
+--- a/execution.py
++++ b/execution.py
+@@ -24,6 +24,7 @@
+ from latent_preview import set_preview_method
+ import nodes
+ from comfy_execution.caching import (
++    CacheEntry,
+     BasicCache,
+     CacheKeySetID,
+     CacheKeySetInputSignature,
+@@ -104,11 +105,6 @@
+         finally:
+             self.is_changed[node_id] = node["is_changed"]
+         return self.is_changed[node_id]
+-
+-
+-class CacheEntry(NamedTuple):
+-    ui: dict
+-    outputs: list
+ 
+ 
+ class CacheType(Enum):
+@@ -614,7 +610,7 @@
+             pending_subgraph_results[unique_id] = cached_outputs
+             return (ExecutionResult.PENDING, None, None)
+ 
+-        cache_entry = CacheEntry(ui=cache_ui_value, outputs=output_data)
++        cache_entry = CacheEntry(ui=cache_ui_value, outputs=output_data, producer=(unique_id, class_type))
+         execution_list.cache_update(unique_id, cache_entry)
+         await caches.outputs.set(unique_id, cache_entry)
+ 
+@@ -768,6 +764,10 @@
+                     node_id for node_id, result in zip(node_ids, cache_results)
+                     if result is not None
+                 ]
++                del cache_results
++                # The gather waiter can otherwise retain entries until the next
++                # event-loop turn, even after nodes release their cache slots.
++                await asyncio.sleep(0)
+ 
+                 comfy.model_management.cleanup_models_gc()
+                 self.add_message("execution_cached",

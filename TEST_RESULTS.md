@@ -1,4 +1,8 @@
-# Validation — 2026-11-08
+# Historical validation — materialize-only implementation
+
+These results describe commit `78ca615`, which did not release executor cache ownership. For the actual release implementation and core integration, see [SOURCE_RELEASE_RESULTS.md](SOURCE_RELEASE_RESULTS.md).
+
+Validation date: 2026-11-08
 
 ## Environment
 

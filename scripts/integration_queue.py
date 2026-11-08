@@ -84,7 +84,8 @@ for generation in range(4 if args.lora else 3):
     assert history["status"]["status_str"] == "success", history["status"]
     cached = next(data["nodes"] for event, data in history["status"]["messages"] if event == "execution_cached")
     if generation:
-        assert {"1", "2", "3", "4"}.issubset(cached), cached
+        assert {"3", "4"}.issubset(cached), cached
+        assert not {"1", "2"}.intersection(cached), "Source loader MODEL/CLIP outputs were not released"
     images = history["outputs"]["10"]["images"]
     print(json.dumps({"stage": "generation", "generation": generation + 1, "lora": generation == 3,
                       "seconds": time.monotonic() - started, "cached_nodes": cached,
