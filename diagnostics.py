@@ -32,6 +32,6 @@ def snapshot():
 def log_materialization(kind, before):
     after = snapshot()
     logging.info("SimpleMerge %s materialized in %.2fs; memory=%s; "
-                 "source references still exist at return; source RAM may remain retained by executor cache. "
-                 "No cache entries evicted.", kind, after["time"] - before["time"],
+                 "source release is deferred until consumers finish when running with cache integration.",
+                 kind, after["time"] - before["time"],
                  {key: round(value, 3) for key, value in after.items() if key != "time"})
