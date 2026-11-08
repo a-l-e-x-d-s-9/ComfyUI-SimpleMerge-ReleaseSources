@@ -1,6 +1,6 @@
 # Actual source release — 2026-11-08
 
-The source-release implementation was tested against an **isolated copy** of the installed ComfyUI checkout. The three-file integration is provided as a reviewable patch; it is not applied automatically to the user's normal installation.
+The source-release implementation was first tested against an **isolated copy** of the installed ComfyUI checkout. After explicit user approval, the reviewed three-file integration and updated nodes were installed on the normal server and verified with the installed plugin stack enabled. Core installation is never automatic.
 
 ## What changed
 
@@ -47,6 +47,20 @@ All figures are per test-server process. Peak RSS is cumulative; CUDA figures de
 
 Generations 2/3 cached exactly **3, 4, 6, 7**: final MODEL/CLIP merges, negative conditioning and the empty latent. Full checkpoint-loader entries **1/2 were absent**, while the VAE socket remained reusable. The LoRA generation cached **3, 4, 7**. Each mode logged exactly **two checkpoint builds, one MODEL materialization and one CLIP materialization** across all four generations. Source checkpoints were not reloaded and final merges were not rebuilt.
 
+## Approved normal-server deployment
+
+The normal server was restarted with its original default cache/GPU flags and installed plugins enabled. It collected all **4,816/4,816** tracked CPU source tensor objects; the overlapping MODEL snapshot collected **3,384/3,384**. RSS during the MODEL release callback fell from **18.428 to 14.551 GiB**. Later sampling changed device placement and allocator usage further. Absolute RSS differs from the isolated process's footprint; it does not measure logical weight bytes alone.
+
+| Normal server, default cache | Seconds | RSS GiB | Peak RSS GiB | Cached nodes |
+|---|---:|---:|---:|---|
+| Baseline | — | 1.875 | 1.875 | — |
+| Generation 1 | 40.695 | 12.135 | 21.345 | none |
+| Generation 2 | 1.037 | 12.136 | 21.345 | 3, 4, 6, 7 |
+| Generation 3 | 1.033 | 12.136 | 21.345 | 3, 4, 6, 7 |
+| Generation 4, LoRA | 5.088 | 13.982 | 21.345 | 3, 4, 7 |
+
+Exactly two checkpoints were built and each merge executed once. The source-loader entries were partial rather than complete cache hits; the retained VAE supported later decoding without checkpoint reload. The normal-server test therefore confirmed the same cache-release/reuse behavior with the user's installed plugins, rather than relying solely on the isolated whitelist test.
+
 ## Regression coverage
 
 **27 tests passed** against the patched core. Besides the existing native weight-parity/independence tests, actual `PromptExecutor` tests verify:
@@ -69,6 +83,6 @@ The ten-checkpoint workflow was not executed. Final-only release still requires 
 
 Existing NaNs in six source CLIP-L last-layer tensors remain a documented input-data limitation; weights are not sanitized. Other branches/extensions/aliases may retain tensors, and severe RAM pressure can still evict final outputs. These cases are reported rather than represented as guaranteed source deallocation or permanent final-model pinning.
 
-**The normal core requires explicit approval before installation**, as required by the user's original brief. Review [the integration explanation](integration/README.md), [the exact patch](integration/cached-output-release.patch), and [the hash-checking installer](scripts/install_cache_integration.py).
+**The normal-core change was explicitly approved and installed.** Further installations still require explicit review/action. See [the integration explanation](integration/README.md), [the exact patch](integration/cached-output-release.patch), and [the hash-checking installer](scripts/install_cache_integration.py).
 
 New files for this revision: `source_release.py`, `tests/test_source_release.py`, `scripts/install_cache_integration.py`, `integration/README.md`, `integration/base_sha256.json`, `integration/cached-output-release.patch`, and this report. `nodes.py`, `diagnostics.py`, the queue-test script and documentation were updated. Raw logs and images remain private and excluded from git.
